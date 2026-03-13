@@ -1,25 +1,26 @@
-import os
 import json
 import re
 from vllm import LLM, SamplingParams
 from datasets import load_dataset
 from typing import List, Callable, Dict
 
-# 导入作业提供的奖励函数（前提是你已克隆仓库） [cite: 140]
+# 导入作业提供的奖励函数（前提是你已克隆仓库）
 # 注意：如果该函数仅适配 MATH，我们可能需要对 GSM8K 做轻微适配
 try:
     from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 except ImportError:
-    # 如果导入失败，我们先定义一个基础的解析逻辑作为备选
-    def r1_zero_reward_fn(model_output: str, ground_truth: str) -> Dict[str, float]:
-        # 提取 <answer> 标签内容
-        match = re.search(r'<answer>(.*?)</answer>', model_output, re.DOTALL)
-        answer = match.group(1).strip() if match else model_output.strip()
-        # 简单数值对比
-        is_correct = 1.0 if answer == ground_truth else 0.0
-        # 格式检查：是否包含闭合标签
-        has_format = 1.0 if match else 0.0
-        return {"reward": is_correct, "format_reward": has_format, "answer_reward": is_correct}
+    # 如果导入失败，定义一个基础的解析逻辑作为备选
+    # 注意：签名需与真实函数保持一致 (response, ground_truth, fast=True)
+    def r1_zero_reward_fn(response: str, ground_truth: str, fast: bool = True) -> Dict[str, float]:
+        # 严格要求 "</think> <answer>...</answer>" 格式（与 grader 一致）
+        has_format = "</think> <answer>" in response and "</answer>" in response
+        if has_format:
+            match = re.search(r'<answer>(.*?)<\/answer>', response, re.DOTALL)
+            answer = match.group(1).strip() if match else ""
+            is_correct = 1.0 if answer == ground_truth.strip() else 0.0
+            return {"format_reward": 1.0, "answer_reward": is_correct, "reward": is_correct}
+        else:
+            return {"format_reward": 0.0, "answer_reward": 0.0, "reward": 0.0}
 
 # 1. 按照作业要求定义 evaluate_vllm 接口 
 def evaluate_vllm(
@@ -43,11 +44,11 @@ def evaluate_vllm(
         generated_text = output.outputs[0].text
         gold = gold_answers[i]
         
-        # 计算评估指标 [cite: 148]
+        # 计算评估指标
         metrics = reward_fn(generated_text, gold)
         total_reward += metrics["reward"]
         
-        # 构造序列化条目 [cite: 148]
+        # 构造序列化条目
         serialized_results.append({
             "prompt": prompts[i],
             "gold_answer": gold,
@@ -55,7 +56,7 @@ def evaluate_vllm(
             "metrics": metrics
         })
     
-    # 将结果序列化到磁盘 [cite: 148]
+    # 将结果序列化到磁盘 
     with open(output_path, "w", encoding="utf-8") as f:
         for entry in serialized_results:
             f.write(json.dumps(entry) + "\n")
@@ -64,15 +65,15 @@ def evaluate_vllm(
     print(f"平均准确率: {total_reward / len(prompts):.2%}")
 
 if __name__ == "__main__":
-    # 配置模型和采样参数 [cite: 141-144]
+    # 配置模型和采样参数
     MODEL_ID = "Qwen/Qwen2.5-Math-1.5B"
     
     sampling_params = SamplingParams(
-        temperature=1.0, # [cite: 141]
-        top_p=1.0,       # [cite: 141]
-        max_tokens=1024, # [cite: 141]
-        stop=["</answer>"], # [cite: 144]
-        include_stop_str_in_output=True # [cite: 144]
+        temperature=1.0,
+        top_p=1.0,      
+        max_tokens=1024,
+        stop=["</answer>"],
+        include_stop_str_in_output=True
     )
 
     # 初始化 vLLM
@@ -85,16 +86,17 @@ if __name__ == "__main__":
     def parse_gsm8k_gold(text):
         return text.split("####")[-1].strip()
 
-    # 3. 格式化为 r1_zero prompt [cite: 79-82, 147]
-    # 我们直接从仓库读取 prompt 文件以保证准确性 [cite: 83]
+    # 3. 格式化为 r1_zero prompt
+    # 我们直接从仓库读取 prompt 文件以保证准确性
     prompt_path = "cs336_alignment/prompts/r1_zero.prompt"
     with open(prompt_path, "r") as f:
         prompt_template = f.read()
 
-    prompts = [prompt_template.format(question=item["question"]) for item in dataset]
+    # 使用 replace 而非 str.format()，防止题目中出现 { } 导致崩溃
+    prompts = [prompt_template.replace("{question}", item["question"]) for item in dataset]
     gold_answers = [parse_gsm8k_gold(item["answer"]) for item in dataset]
 
-    # 4. 运行评估并保存结果 [cite: 148]
+    # 4. 运行评估并保存结果
     evaluate_vllm(
         vllm_model=llm,
         reward_fn=r1_zero_reward_fn,
