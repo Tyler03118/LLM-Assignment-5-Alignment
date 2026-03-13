@@ -83,8 +83,6 @@ if __name__ == "__main__":
     # 官方 MATH 测试集通常是 5000 条，我们可以取数据集的最后 5000 条
     # 或者为了快速跑通实验先取前 1000 条进行测试
     dataset = full_dataset.select(range(len(full_dataset) - 5000, len(full_dataset)))
-
-
     
     # 3. 读取并准备 Prompts
     prompt_path = "cs336_alignment/prompts/r1_zero.prompt"
