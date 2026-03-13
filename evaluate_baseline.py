@@ -80,21 +80,20 @@ if __name__ == "__main__":
     llm = LLM(model=MODEL_ID, gpu_memory_utilization=0.85)
 
     # 2. 加载数据 (用 GSM8K 替代 MATH)
-    dataset = load_dataset("openai/gsm8k", "main", split="test")
+    dataset = load_dataset("competition_math", split="test")
     
     # 提取 GSM8K 的标准答案（通常在 #### 之后）
     def parse_gsm8k_gold(text):
         return text.split("####")[-1].strip()
 
     # 3. 格式化为 r1_zero prompt
-    # 我们直接从仓库读取 prompt 文件以保证准确性
     prompt_path = "cs336_alignment/prompts/r1_zero.prompt"
     with open(prompt_path, "r") as f:
         prompt_template = f.read()
 
-    # 使用 replace 而非 str.format()，防止题目中出现 { } 导致崩溃
-    prompts = [prompt_template.replace("{question}", item["question"]) for item in dataset]
-    gold_answers = [parse_gsm8k_gold(item["answer"]) for item in dataset]
+    # 注意：MATH 数据集里的问题字段叫 "problem"，答案字段叫 "solution"
+    prompts = [prompt_template.replace("{question}", item["problem"]) for item in dataset]
+    gold_answers = [item["solution"] for item in dataset]
 
     # 4. 运行评估并保存结果
     evaluate_vllm(
@@ -103,5 +102,5 @@ if __name__ == "__main__":
         prompts=prompts,
         gold_answers=gold_answers,
         eval_sampling_params=sampling_params,
-        output_path="baseline_gsm8k_results.jsonl"
+        output_path="baseline_math_results.jsonl"
     )
