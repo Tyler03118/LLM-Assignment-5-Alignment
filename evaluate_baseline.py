@@ -76,9 +76,15 @@ if __name__ == "__main__":
     # 在 A100 上建议预留一点显存给 vLLM 的缓存
     llm = LLM(model=MODEL_ID, gpu_memory_utilization=0.85)
 
-    # 2. 加载 MATH 数据集
+    # 2. 加载 MATH 数据集, 镜像可能只有 train 分
     print("正在加载 MATH 数据集...")
-    dataset = load_dataset("qwedsacf/competition_math", split="test")
+    full_dataset = load_dataset("qwedsacf/competition_math", split="train")
+
+    # 官方 MATH 测试集通常是 5000 条，我们可以取数据集的最后 5000 条
+    # 或者为了快速跑通实验先取前 1000 条进行测试
+    dataset = full_dataset.select(range(len(full_dataset) - 5000, len(full_dataset)))
+
+
     
     # 3. 读取并准备 Prompts
     prompt_path = "cs336_alignment/prompts/r1_zero.prompt"
