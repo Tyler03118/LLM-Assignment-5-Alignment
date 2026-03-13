@@ -78,7 +78,7 @@ if __name__ == "__main__":
 
     # 2. 加载 MATH 数据集
     print("正在加载 MATH 数据集...")
-    dataset = load_dataset("competition_math", split="test")
+    dataset = load_dataset("qwedsacf/competition_math", split="test")
     
     # 3. 读取并准备 Prompts
     prompt_path = "cs336_alignment/prompts/r1_zero.prompt"
