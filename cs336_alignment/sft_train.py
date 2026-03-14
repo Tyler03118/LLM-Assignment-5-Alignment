@@ -30,19 +30,25 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
 def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
     """
-    Start the inference process, here we use vLLM to hold a model on
-    a GPU separate from the policy.
+    启动 vLLM 推理引擎，并兼容最新版 vLLM 的环境。
     """
     vllm_set_random_seed(seed)
-    # Monkeypatch from TRL:
-    # Patch vLLM to make sure we can
-    # (1) place the vLLM model on the desired device (world_size_patch) and
-    # (2) avoid a test that is not designed for our setting (profiling_patch).
+    
+    # 补丁 1：欺骗系统，让它以为我们只用单卡
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None
-    )
+    
+    # 补丁 2：兼容最新版 vLLM。如果找不到老模块，就安全跳过这个补丁
+    try:
+        import vllm.worker.worker
+        profiling_patch = patch(
+            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+            return_value=None,
+            create=True # 防止新版本删除了这个函数而报错
+        )
+    except (ImportError, AttributeError):
+        # 如果是新版 vLLM，直接忽略这个旧补丁
+        profiling_patch = contextlib.nullcontext()
+        
     with world_size_patch, profiling_patch:
         return LLM(
             model=model_id,
