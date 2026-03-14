@@ -9,12 +9,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import SamplingParams, LLM
 from unittest.mock import patch
 
-# 针对老版本 vLLM 的随机种子导入
-try:
-    from vllm.model_executor import set_random_seed as vllm_set_random_seed
-except ImportError:
-    from vllm.model_executor.parallel_utils.parallel_state import set_random_seed as vllm_set_random_seed
-
+def vllm_set_random_seed(seed):
+    """万能随机种子设置，不依赖任何特定版本的 vLLM 内部 API"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        
 # 导入你写的核心组件
 from cs336_alignment.sft_helper import (
     tokenize_prompt_and_output, 
