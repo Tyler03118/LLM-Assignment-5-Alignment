@@ -14,7 +14,6 @@ from cs336_alignment.sft_helper import (
     get_response_log_probs, 
     sft_microbatch_train_step
 )
-from adapters import init_vllm, load_policy_into_vllm_instance
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
 # ================= 1. 辅助函数：数据加载与评估 =================
