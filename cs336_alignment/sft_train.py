@@ -7,7 +7,15 @@ import wandb
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import SamplingParams, LLM
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
+try:
+    from vllm.model_executor import set_random_seed as vllm_set_random_seed
+except ImportError:
+    try:
+        from vllm.model_executor.parallel_utils.parallel_state import set_random_seed as vllm_set_random_seed
+    except ImportError:
+        import random, numpy as np
+        def vllm_set_random_seed(seed):
+            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
 from unittest.mock import patch
 
 # 导入你写的核心组件
