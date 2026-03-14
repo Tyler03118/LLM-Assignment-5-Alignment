@@ -5,8 +5,10 @@ import argparse
 import torch
 import wandb
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from vllm import SamplingParams
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
+from vllm import SamplingParams, LLM
+from vllm.model_executor.parallel_utils.parallel_state import set_random_seed as vllm_set_random_seed
+from unittest.mock import patch
 
 # 导入你写的核心组件
 from cs336_alignment.sft_helper import (
@@ -15,6 +17,40 @@ from cs336_alignment.sft_helper import (
     sft_microbatch_train_step
 )
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+
+# ================= 0. vLLM 兼容性工具函数 (Starter Code) =================
+
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
+    """
+    Start the inference process, here we use vLLM to hold a model on
+    a GPU separate from the policy.
+    """
+    vllm_set_random_seed(seed)
+    # Monkeypatch from TRL:
+    # Patch vLLM to make sure we can
+    # (1) place the vLLM model on the desired device (world_size_patch) and
+    # (2) avoid a test that is not designed for our setting (profiling_patch).
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    profiling_patch = patch(
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        return_value=None
+    )
+    with world_size_patch, profiling_patch:
+        return LLM(
+            model=model_id,
+            device=device,
+            dtype=torch.bfloat16,
+            enable_prefix_caching=True,
+            gpu_memory_utilization=gpu_memory_utilization,
+        )
+
+def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
+    """
+    Copied from TRL's grpo_trainer.
+    """
+    state_dict = policy.state_dict()
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    llm_model.load_weights(state_dict.items())
 
 # ================= 1. 辅助函数：数据加载与评估 =================
 
@@ -41,7 +77,7 @@ def load_my_sft_data(file_path, limit=None):
 
 
 def run_vllm_evaluation(llm, val_file_path, reward_fn):
-    """使用 vLLM 进行极速评估并计算准确率"""
+    """使用 vLLM 进行极速评估"""
     if not os.path.exists(val_file_path):
         print(f"⚠️ 找不到验证集文件: {val_file_path}，跳过评估。")
         return 0.0
@@ -51,30 +87,24 @@ def run_vllm_evaluation(llm, val_file_path, reward_fn):
     with open(val_file_path, "r", encoding="utf-8") as f:
         for line in f:
             data = json.loads(line)
-            # 根据你之前的发现，验证集的 prompt 字段可能是 'problem' 或 'prompt'
             p = data.get("prompt") or data.get("problem")
-            gt = data.get("ground_truth") or data.get("expected_answer") or data.get("answer")
+            gt = data.get("ground_truth") or data.get("expected_answer")
             val_prompts.append(p)
             val_gts.append(gt)
 
-    print(f"🚀 正在对 {len(val_prompts)} 条验证数据进行推理...")
+    print(f"🚀 正在使用 vLLM 进行极速评估 ({len(val_prompts)} 条)...")
     
-    # 设置生成参数
     sampling_params = SamplingParams(
-        temperature=0.0,  # 贪心解码保证结果一致性
+        temperature=0.0,
         max_tokens=1024,
-        stop=["</answer>"] # 遇到结束符就停止，节省时间
+        stop=["</answer>"]
     )
 
-    # 批量生成结果
     outputs = llm.generate(val_prompts, sampling_params, use_tqdm=True)
     
     total_reward = 0.0
-    
-    # 判卷
     for output, gt in zip(outputs, val_gts):
         generated_text = output.outputs[0].text
-        # 如果模型没有生成完整的结束标签，为了 reward_fn 能正常工作，我们可以简单补全
         if "</answer>" not in generated_text:
             generated_text += "</answer>"
             
@@ -111,9 +141,8 @@ def train(args):
         device_map="cuda:0"
     )
     
-    print("初始化 vLLM 引擎...")
-    # 限制显存，防止与 PyTorch 训练冲突
-    llm = init_vllm(args.model_id, device="cuda:0", seed=42, gpu_memory_utilization=0.4)
+    print("初始化 vLLM 引擎 (单卡模式，占用 20% 显存)...")
+    llm = init_vllm(args.model_id, device="cuda:0", seed=42, gpu_memory_utilization=0.2)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     
@@ -179,9 +208,8 @@ def train(args):
 
             # ================= 4. 周期性评估 =================
             if global_train_step % args.eval_every == 0:
-                print(f"\n[{global_train_step} 步] 正在同步权重至 vLLM 并进行评估...")
+                print(f"\n[{global_train_step} 步] 同步权重并进行 vLLM 评估...")
                 model.eval()
-                
                 load_policy_into_vllm_instance(model, llm)
                 acc = run_vllm_evaluation(llm, args.val_data, r1_zero_reward_fn)
                 
