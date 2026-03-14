@@ -200,7 +200,7 @@ if __name__ == "__main__":
     parser.add_argument("--micro_batch_size", type=int, default=4)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--eval_every", type=int, default=50)
+    parser.add_argument("--eval_every", type=int, default=120)
     
     args = parser.parse_args()
     train(args)
