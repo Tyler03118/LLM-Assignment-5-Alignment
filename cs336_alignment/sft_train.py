@@ -1,4 +1,5 @@
 import os
+os.environ["VLLM_USE_V1"] = "0"
 import json
 import math
 import argparse
@@ -58,10 +59,27 @@ def init_vllm(model_id: str, seed: int, gpu_memory_utilization: float = 0.85):
 
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     """
-    Copied from TRL's grpo_trainer.
+    同步 PyTorch 模型的权重到 vLLM 实例中 (兼容各种新老版本 vLLM)
     """
     state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
+    
+    engine = llm.llm_engine
+    
+    # 动态寻找 executor (vLLM 经常给它改名)
+    executor = getattr(engine, "model_executor", None)
+    if executor is None:
+        executor = getattr(engine, "executor", None)
+        
+    if executor is None:
+        raise RuntimeError("无法找到 vLLM 的 executor。请确认环境变量 VLLM_USE_V1='0' 已生效。")
+        
+    # 动态寻找 worker
+    worker = getattr(executor, "driver_worker", None)
+    if worker is None:
+        worker = getattr(executor, "worker", None)
+        
+    # 最终替换权重
+    llm_model = worker.model_runner.model
     llm_model.load_weights(state_dict.items())
 
 # ================= 1. 辅助函数：数据加载与评估 =================
