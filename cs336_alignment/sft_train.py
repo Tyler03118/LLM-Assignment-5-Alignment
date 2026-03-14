@@ -32,6 +32,9 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
     """
     启动 vLLM 推理引擎，并兼容最新版 vLLM 的环境。
     """
+    import contextlib  # <--- 加上了这个！
+    from unittest.mock import patch
+    
     vllm_set_random_seed(seed)
     
     # 补丁 1：欺骗系统，让它以为我们只用单卡
