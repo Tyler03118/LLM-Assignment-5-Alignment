@@ -9,6 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import SamplingParams, LLM
 from unittest.mock import patch
 import random
+import numpy as np
 
 
 def vllm_set_random_seed(seed):
