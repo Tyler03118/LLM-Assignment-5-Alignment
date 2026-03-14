@@ -1,0 +1,213 @@
+import os
+import json
+import math
+import argparse
+import torch
+import wandb
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import SamplingParams
+
+# 导入你写的核心组件
+from cs336_alignment.sft import (
+    tokenize_prompt_and_output, 
+    get_response_log_probs, 
+    sft_microbatch_train_step
+)
+from adapters import init_vllm, load_policy_into_vllm_instance
+from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
+
+# ================= 1. 辅助函数：数据加载与评估 =================
+
+def load_my_sft_data(file_path, limit=None):
+    """加载 JSONL 数据，支持限制数量（用于 Experiment 1 的数据缩放实验）"""
+    prompts = []
+    responses = []
+    
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"找不到数据文件: {file_path}")
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        if limit is not None:
+            lines = lines[:limit]
+            
+        for line in lines:
+            data = json.loads(line)
+            prompts.append(data["prompt"])
+            responses.append(data["response"])
+            
+    print(f"✅ 成功从 {file_path} 加载了 {len(prompts)} 条训练数据。")
+    return prompts, responses
+
+
+def run_vllm_evaluation(llm, val_file_path, reward_fn):
+    """使用 vLLM 进行极速评估并计算准确率"""
+    if not os.path.exists(val_file_path):
+        print(f"⚠️ 找不到验证集文件: {val_file_path}，跳过评估。")
+        return 0.0
+
+    val_prompts = []
+    val_gts = []
+    with open(val_file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            data = json.loads(line)
+            # 根据你之前的发现，验证集的 prompt 字段可能是 'problem' 或 'prompt'
+            p = data.get("prompt") or data.get("problem")
+            gt = data.get("ground_truth") or data.get("expected_answer") or data.get("answer")
+            val_prompts.append(p)
+            val_gts.append(gt)
+
+    print(f"🚀 正在对 {len(val_prompts)} 条验证数据进行推理...")
+    
+    # 设置生成参数
+    sampling_params = SamplingParams(
+        temperature=0.0,  # 贪心解码保证结果一致性
+        max_tokens=1024,
+        stop=["</answer>"] # 遇到结束符就停止，节省时间
+    )
+
+    # 批量生成结果
+    outputs = llm.generate(val_prompts, sampling_params, use_tqdm=True)
+    
+    total_reward = 0.0
+    
+    # 判卷
+    for output, gt in zip(outputs, val_gts):
+        generated_text = output.outputs[0].text
+        # 如果模型没有生成完整的结束标签，为了 reward_fn 能正常工作，我们可以简单补全
+        if "</answer>" not in generated_text:
+            generated_text += "</answer>"
+            
+        result = reward_fn(generated_text, gt)
+        total_reward += result.get("answer_reward", 0.0)
+
+    accuracy = (total_reward / len(val_prompts)) * 100
+    print(f"🎯 验证集准确率: {accuracy:.2f}%")
+    return accuracy
+
+
+# ================= 2. 主训练循环 =================
+
+def train(args):
+    # 配置实验名称
+    run_name = f"sft-size-{args.limit if args.limit else 'full'}"
+    wandb.init(project="cs336-sft-reasoning", name=run_name, config=vars(args))
+    
+    # Setup wandb metrics as requested in the assignment
+    wandb.define_metric("train_step")
+    wandb.define_metric("eval_step")
+    wandb.define_metric("train/*", step_metric="train_step")
+    wandb.define_metric("eval/*", step_metric="eval_step")
+    
+    print("加载 Tokenizer 和 模型...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
+    # 确保 pad_token 存在
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_id, 
+        torch_dtype=torch.bfloat16, 
+        device_map="cuda:0"
+    )
+    
+    print("初始化 vLLM 引擎...")
+    # 限制显存，防止与 PyTorch 训练冲突
+    llm = init_vllm(args.model_id, device="cuda:0", seed=42, gpu_memory_utilization=0.4)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    
+    # 加载数据
+    prompts, responses = load_my_sft_data(args.train_data, limit=args.limit)
+
+    # 评估初始模型 (Baseline)
+    print("📊 训练前 Baseline 评估:")
+    load_policy_into_vllm_instance(model, llm)
+    baseline_acc = run_vllm_evaluation(llm, args.val_data, r1_zero_reward_fn)
+    wandb.log({"eval/accuracy": baseline_acc, "eval_step": 0})
+
+    global_train_step = 0
+    eval_step = 1
+
+    print("🔥 开始训练...")
+    for epoch in range(args.epochs):
+        model.train()
+        
+        # 将数据切成 Batch
+        for i in tqdm(range(0, len(prompts), args.batch_size), desc=f"Epoch {epoch+1}/{args.epochs}"):
+            batch_prompts = prompts[i : i + args.batch_size]
+            batch_responses = responses[i : i + args.batch_size]
+            
+            # 如果最后一个 batch 只有 1 个样本且包含 micro_batch 逻辑，可能会出问题，安全起见我们跳过它
+            if len(batch_prompts) < args.micro_batch_size:
+                continue
+                
+            optimizer.zero_grad()
+            
+            # 动态计算当前 batch 需要多少次累积
+            current_accum_steps = math.ceil(len(batch_prompts) / args.micro_batch_size)
+            
+            # --- 梯度累积循环 (Microbatches) ---
+            for j in range(0, len(batch_prompts), args.micro_batch_size):
+                mb_prompts = batch_prompts[j : j + args.micro_batch_size]
+                mb_responses = batch_responses[j : j + args.micro_batch_size]
+                
+                # 1. 数据处理
+                data = tokenize_prompt_and_output(mb_prompts, mb_responses, tokenizer)
+                input_ids = data["input_ids"].to("cuda:0")
+                labels = data["labels"].to("cuda:0")
+                mask = data["response_mask"].to("cuda:0")
+                
+                # 2. 前向传播算概率
+                outputs = get_response_log_probs(model, input_ids, labels)
+                
+                # 3. 反向传播 (内含 backward)
+                loss, meta = sft_microbatch_train_step(
+                    outputs["log_probs"], mask, current_accum_steps
+                )
+            
+            # 4. 更新参数
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # 作业建议的梯度裁剪
+            optimizer.step()
+            global_train_step += 1
+            
+            wandb.log({
+                "train/loss": loss.item(), 
+                "train/avg_log_probs": meta.get("avg_log_probs", 0),
+                "train_step": global_train_step
+            })
+
+            # ================= 4. 周期性评估 =================
+            if global_train_step % args.eval_every == 0:
+                print(f"\n[{global_train_step} 步] 正在同步权重至 vLLM 并进行评估...")
+                model.eval()
+                
+                load_policy_into_vllm_instance(model, llm)
+                acc = run_vllm_evaluation(llm, args.val_data, r1_zero_reward_fn)
+                
+                wandb.log({"eval/accuracy": acc, "eval_step": eval_step})
+                eval_step += 1
+                model.train()
+
+    # 训练结束后做最后一次评估
+    print("🏁 训练结束，进行最终评估...")
+    model.eval()
+    load_policy_into_vllm_instance(model, llm)
+    final_acc = run_vllm_evaluation(llm, args.val_data, r1_zero_reward_fn)
+    wandb.log({"eval/accuracy": final_acc, "eval_step": eval_step})
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="CS336 Assignment 5 SFT Training")
+    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-Math-1.5B")
+    parser.add_argument("--train_data", type=str, default="data/MATH/sft_full.jsonl")
+    parser.add_argument("--val_data", type=str, default="data/MATH/val.jsonl")
+    parser.add_argument("--limit", type=int, default=None, help="限制训练数据的数量，比如 128, 256")
+    parser.add_argument("--batch_size", type=int, default=32, help="全局有效 Batch Size")
+    parser.add_argument("--micro_batch_size", type=int, default=4, help="每次前向传播的样本数 (防 OOM)")
+    parser.add_argument("--learning_rate", type=float, default=2e-5)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--eval_every", type=int, default=50, help="每多少个 global step 评估一次")
+    
+    args = parser.parse_args()
+    train(args)
