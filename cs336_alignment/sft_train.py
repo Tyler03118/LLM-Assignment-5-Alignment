@@ -7,6 +7,7 @@ import wandb
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import SamplingParams, LLM
+import contextlib
 try:
     from vllm.model_executor import set_random_seed as vllm_set_random_seed
 except ImportError:
@@ -28,38 +29,32 @@ from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
 # ================= 0. vLLM 兼容性工具函数 (Starter Code) =================
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85):
-    """
-    启动 vLLM 推理引擎，并兼容最新版 vLLM 的环境。
-    """
-    import contextlib  # <--- 加上了这个！
+def init_vllm(model_id: str, seed: int, gpu_memory_utilization: float = 0.85):
+    import contextlib
     from unittest.mock import patch
-    
+
     vllm_set_random_seed(seed)
-    
-    # 补丁 1：欺骗系统，让它以为我们只用单卡
+
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    
-    # 补丁 2：兼容最新版 vLLM。如果找不到老模块，就安全跳过这个补丁
+
     try:
         import vllm.worker.worker
         profiling_patch = patch(
             "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
             return_value=None,
-            create=True # 防止新版本删除了这个函数而报错
+            create=True,
         )
     except (ImportError, AttributeError):
-        # 如果是新版 vLLM，直接忽略这个旧补丁
         profiling_patch = contextlib.nullcontext()
-        
+
     with world_size_patch, profiling_patch:
         return LLM(
             model=model_id,
-            device=device,
-            dtype=torch.bfloat16,
+            dtype="bfloat16",
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
         )
+
 
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
     """
@@ -159,7 +154,7 @@ def train(args):
     )
     
     print("初始化 vLLM 引擎 (单卡模式，占用 20% 显存)...")
-    llm = init_vllm(args.model_id, device="cuda:0", seed=42, gpu_memory_utilization=0.2)
+    llm = init_vllm(args.model_id, seed=42, gpu_memory_utilization=0.2)
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     
