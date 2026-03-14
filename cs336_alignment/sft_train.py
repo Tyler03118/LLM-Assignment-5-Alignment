@@ -8,6 +8,8 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import SamplingParams, LLM
 from unittest.mock import patch
+import random
+
 
 def vllm_set_random_seed(seed):
     """万能随机种子设置，不依赖任何特定版本的 vLLM 内部 API"""
@@ -16,7 +18,7 @@ def vllm_set_random_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-        
+
 # 导入你写的核心组件
 from cs336_alignment.sft_helper import (
     tokenize_prompt_and_output, 
