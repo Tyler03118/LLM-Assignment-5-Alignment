@@ -1,5 +1,4 @@
 import os
-os.environ["VLLM_USE_V1"] = "0"
 import json
 import math
 import argparse
@@ -8,17 +7,13 @@ import wandb
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import SamplingParams, LLM
-import contextlib
+from unittest.mock import patch
+
+# 针对老版本 vLLM 的随机种子导入
 try:
     from vllm.model_executor import set_random_seed as vllm_set_random_seed
 except ImportError:
-    try:
-        from vllm.model_executor.parallel_utils.parallel_state import set_random_seed as vllm_set_random_seed
-    except ImportError:
-        import random, numpy as np
-        def vllm_set_random_seed(seed):
-            random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-from unittest.mock import patch
+    from vllm.model_executor.parallel_utils.parallel_state import set_random_seed as vllm_set_random_seed
 
 # 导入你写的核心组件
 from cs336_alignment.sft_helper import (
@@ -28,26 +23,18 @@ from cs336_alignment.sft_helper import (
 )
 from cs336_alignment.drgrpo_grader import r1_zero_reward_fn
 
-# ================= 0. vLLM 兼容性工具函数 (Starter Code) =================
+# ================= 0. vLLM 兼容性工具函数 (v0.5.4 稳定版) =================
 
-def init_vllm(model_id: str, seed: int, gpu_memory_utilization: float = 0.85):
-    import contextlib
-    from unittest.mock import patch
-
+def init_vllm(model_id: str, seed: int, gpu_memory_utilization: float = 0.2):
+    """最原始、最干净的 vLLM 初始化 (适用于 v0.5.4)"""
     vllm_set_random_seed(seed)
-
+    
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-
-    try:
-        import vllm.worker.worker
-        profiling_patch = patch(
-            "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-            return_value=None,
-            create=True,
-        )
-    except (ImportError, AttributeError):
-        profiling_patch = contextlib.nullcontext()
-
+    profiling_patch = patch(
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        return_value=None
+    )
+    
     with world_size_patch, profiling_patch:
         return LLM(
             model=model_id,
@@ -56,36 +43,17 @@ def init_vllm(model_id: str, seed: int, gpu_memory_utilization: float = 0.85):
             gpu_memory_utilization=gpu_memory_utilization,
         )
 
-
 def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
-    """
-    同步 PyTorch 模型的权重到 vLLM 实例中 (兼容各种新老版本 vLLM)
-    """
+    """完美适配 vLLM 0.5.4 的权重同步逻辑"""
     state_dict = policy.state_dict()
-    
-    engine = llm.llm_engine
-    
-    # 动态寻找 executor (vLLM 经常给它改名)
-    executor = getattr(engine, "model_executor", None)
-    if executor is None:
-        executor = getattr(engine, "executor", None)
-        
-    if executor is None:
-        raise RuntimeError("无法找到 vLLM 的 executor。请确认环境变量 VLLM_USE_V1='0' 已生效。")
-        
-    # 动态寻找 worker
-    worker = getattr(executor, "driver_worker", None)
-    if worker is None:
-        worker = getattr(executor, "worker", None)
-        
-    # 最终替换权重
-    llm_model = worker.model_runner.model
+    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
+
 
 # ================= 1. 辅助函数：数据加载与评估 =================
 
 def load_my_sft_data(file_path, limit=None):
-    """加载 JSONL 数据，支持限制数量（用于 Experiment 1 的数据缩放实验）"""
+    """加载 JSONL 数据，支持限制数量"""
     prompts = []
     responses = []
     
@@ -153,7 +121,6 @@ def train(args):
     run_name = f"sft-size-{args.limit if args.limit else 'full'}"
     wandb.init(project="cs336-sft-reasoning", name=run_name, config=vars(args))
     
-    # Setup wandb metrics as requested in the assignment
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
     wandb.define_metric("train/*", step_metric="train_step")
@@ -161,7 +128,6 @@ def train(args):
     
     print("加载 Tokenizer 和 模型...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    # 确保 pad_token 存在
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
@@ -197,13 +163,10 @@ def train(args):
             batch_prompts = prompts[i : i + args.batch_size]
             batch_responses = responses[i : i + args.batch_size]
             
-            # 如果最后一个 batch 只有 1 个样本且包含 micro_batch 逻辑，可能会出问题，安全起见我们跳过它
             if len(batch_prompts) < args.micro_batch_size:
                 continue
                 
             optimizer.zero_grad()
-            
-            # 动态计算当前 batch 需要多少次累积
             current_accum_steps = math.ceil(len(batch_prompts) / args.micro_batch_size)
             
             # --- 梯度累积循环 (Microbatches) ---
@@ -226,7 +189,7 @@ def train(args):
                 )
             
             # 4. 更新参数
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # 作业建议的梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             global_train_step += 1
             
