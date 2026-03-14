@@ -9,7 +9,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import SamplingParams
 
 # 导入你写的核心组件
-from cs336_alignment.sft import (
+from cs336_alignment.sft_helper import (
     tokenize_prompt_and_output, 
     get_response_log_probs, 
     sft_microbatch_train_step
