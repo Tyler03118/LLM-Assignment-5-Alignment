@@ -7,7 +7,7 @@ import wandb
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel
 from vllm import SamplingParams, LLM
-from vllm.model_executor.parallel_utils.parallel_state import set_random_seed as vllm_set_random_seed
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
 from unittest.mock import patch
 
 # 导入你写的核心组件
