@@ -161,7 +161,7 @@ def sft_microbatch_train_step(
     """
     在单个 microbatch 上执行前向和后向传播。
     """
-    # 1. 计算负对数概率 (Negative Log-Likelihood)
+    # 1. 计算负对数概率 (Negative Log-Likelihood), 这个就是sft的loss
     # 我们希望 log_p 越大越好，所以 Loss 是 -log_p
     nll_per_token = -policy_log_probs
 
